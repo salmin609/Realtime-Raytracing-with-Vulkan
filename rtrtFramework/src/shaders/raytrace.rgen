@@ -1,0 +1,498 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64  : require
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#include "shared_structs.h"
+
+float PI = 3.14159265359;
+
+// The ray payload, attached to a ray; used to communicate between shader stages.
+layout(location=0) rayPayloadEXT RayPayload payload;
+
+// Push constant for ray tracing shaders
+layout(push_constant) uniform _PushConstantRay { PushConstantRay pcRay; };
+
+// Ray tracing descriptor set: 0:acceleration structure, and 1: color output image
+layout(set=0, binding=0) uniform accelerationStructureEXT topLevelAS;
+layout(set=0, binding=1, rgba32f) uniform image2D colCurr; // Output image: m_rtColCurrBuffer
+layout(set=0, binding=2, scalar) buffer _emitter { Emitter list[]; } emitter;
+
+layout(set=0, binding=3, rgba32f) uniform image2D colPrev; // Output image: m_rtColCurrBuffer
+layout(set=0, binding=4, rgba32f) uniform image2D ndCurr;
+layout(set=0, binding=5, rgba32f) uniform image2D ndPrev;
+layout(set=0, binding=6, rgba32f) uniform image2D kdCurr;
+//layout(set=0, binding=7, rgba32f) uniform image2D nrmPrev;
+
+// Object model descriptor set: 0: matrices, 1:object buffer addresses, 2: texture list
+layout(set=1, binding=0) uniform _MatrixUniforms { MatrixUniforms mats; };
+layout(set=1, binding=1, scalar) buffer ObjDesc_ { ObjDesc i[]; } objDesc;
+layout(set=1, binding=2) uniform sampler2D textureSamplers[];
+
+// Object buffered data; dereferenced from ObjDesc addresses
+layout(buffer_reference, scalar) buffer Vertices {Vertex v[]; }; // Position, normals, ..
+layout(buffer_reference, scalar) buffer Indices {ivec3 i[]; }; // Triangle indices
+layout(buffer_reference, scalar) buffer Materials {Material m[]; }; // Array of all materials
+layout(buffer_reference, scalar) buffer MatIndices {int i[]; }; // Material ID for each triangle
+
+int ap = 100;
+float tanTV = 0;
+int numberOfLights = 8;
+
+
+// Generate a random unsigned int from two unsigned int values, using 16 pairs
+// of rounds of the Tiny Encryption Algorithm. See Zafar, Olano, and Curtis,
+// "GPU Random Numbers via the Tiny Encryption Algorithm"
+uint tea(uint val0, uint val1)
+{
+  uint v0 = val0;
+  uint v1 = val1;
+  uint s0 = 0;
+
+  for(uint n = 0; n < 16; n++)
+  {
+    s0 += 0x9e3779b9;
+    v0 += ((v1 << 4) + 0xa341316c) ^ (v1 + s0) ^ ((v1 >> 5) + 0xc8013ea4);
+    v1 += ((v0 << 4) + 0xad90777d) ^ (v0 + s0) ^ ((v0 >> 5) + 0x7e95761e);
+  }
+
+  return v0;
+}
+
+// Generate a random unsigned int in [0, 2^24) given the previous RNG state
+// using the Numerical Recipes linear congruential generator
+uint lcg(inout uint prev)
+{
+    uint LCG_A = 1664525u;
+    uint LCG_C = 1013904223u;
+    prev       = (LCG_A * prev + LCG_C);
+    return prev & 0x00FFFFFF;
+}
+
+// Generate a random float in [0, 1) given the previous RNG state
+float rnd(inout uint prev)
+{
+    return (float(lcg(prev)) / float(0x01000000));
+}
+
+// Returns a vector around A, at a "polar" angle cos=cTheta, and an "equatorial" angle Phi
+vec3 SampleLobe(vec3 A, float cTheta, float Phi)
+{
+    float sTheta = sqrt(1- cTheta*cTheta); // Sine of Theta
+    vec3 K = vec3(sTheta*cos(Phi), sTheta*sin(Phi), cTheta); // Vector centered on Z instead of A
+
+
+    // Form coordinate frame around A
+    if (abs(A.z-1.0) < 1e-3) return K;
+    if (abs(A.z+1.0) < 1e-3) return vec3(K[0], -K[1], -K[2]);
+    vec3 B = normalize(vec3(-A[1], A[0], 0.0)); // Z x A
+    vec3 C = cross(A,B);
+    
+    // Rotate Z to A, taking K along with
+    return K[0]*B + K[1]*C + K[2]*A;
+}
+
+// @@ Implement these:
+vec3 F(vec3 L, vec3 H, vec3 Ks)
+{
+    float D = dot(L, H);
+
+    float last = 1 - abs(D);
+
+    float temp = pow(last, 5);
+
+    vec3 temp2 = (1.f - Ks) * temp;
+
+    vec3 result = Ks + temp2;
+
+    return result;
+}
+
+float D(vec3 N, vec3 H)
+{
+    float mDotN = dot(N,H);
+
+    if(mDotN < 0)
+        return 0.0;
+
+    float firstVal = ((ap + 2.0) / (2.0 * PI));
+    float secondVal = pow(mDotN , ap);
+
+    return firstVal * secondVal;
+}
+
+float G1(vec3 V, vec3 H, vec3 N)
+{
+    const float eps = 0.000001;
+
+    float vDotN = dot(V, N);
+
+    if(vDotN  > 1.f)
+        return 1.f;
+
+    tanTV = sqrt(1.0 - (vDotN * vDotN)) / vDotN;
+
+    if(abs(tanTV) < eps)
+    {
+        //means tanTV is zero
+        return 1.0f;
+    }
+
+    float a = sqrt(ap / 2.0 + 1.0) / tanTV;
+
+
+    if(a < 1.6f)
+    {
+        float upper = 3.535f * a + 2.181f * (a * a);
+		float down = 1.0f + 2.276f * a + 2.577f * (a * a);
+		float result = upper / down;
+
+		return result;
+    }
+    else
+        return 1.f;       
+}
+
+float G(vec3 L, vec3 V, vec3 H, vec3 N)
+{
+    float first = G1(L, H, N);
+    float second = G1(V, H, N);
+
+    return first * second;
+}
+
+
+// Returns *almost* the full lighting calculation.
+// Full lighting calculation includes I (N dot L) BRDF(...)
+// This excludes light I;    returns    (N dot L) BRDF(...)
+// returns full  NL*(Kd/pi+F*G*D/den);  or diffuse only NL*(Kd/pi) lighting calc.
+vec3 EvalBrdf(vec3 N, vec3 L, vec3 V, Material mat) 
+{
+    vec3 firstVal = mat.diffuse / PI;
+    vec3 H = normalize(L + V);
+    float visibility = abs(dot(N, L));
+
+    vec3 Fval = F(L, H, mat.specular);
+    float Dval = D(N, H);
+    float Gval = G(L, V, H, N);
+
+    vec3 secondVal = (Fval * Gval * Dval) / (4 * dot(L, N) * dot(V, N));
+
+    return visibility * (firstVal + secondVal);
+}
+
+// Sample a cosine log around the N direction;
+// Later, get smart about specular directions.
+vec3 SampleBrdf(inout uint seed, in vec3 N) 
+{
+    vec3 result;
+    
+    result = SampleLobe(N, sqrt(rnd(seed)), 2 * PI * rnd(seed));
+
+    return result;
+}
+
+// The probability distribution of the SampleBrdf function.
+float PdfBrdf(vec3 N, vec3 Wi) 
+{
+    float result;
+
+    result = abs(dot(N, Wi)) / PI;
+
+    return result;
+}
+
+Emitter SampleLight(uint seed)
+{
+    float randNum = rnd(seed);
+    int randomIndex = 0;
+
+    if(randNum > 0.125 && randNum <= 0.25)
+        randomIndex = 1;
+    else if(randNum > 0.25 && randNum <= 0.375)
+        randomIndex = 2;
+    else if(randNum > 0.375 && randNum <= 0.5)
+        randomIndex = 3;
+    else if(randNum > 0.5 && randNum <= 0.625)
+        randomIndex = 4;
+    else if(randNum > 0.625 && randNum <= 0.75)
+        randomIndex = 5;
+    else if(randNum > 0.75 && randNum <= 0.875)
+        randomIndex = 6;
+    else if(randNum > 0.875)
+        randomIndex = 7;
+
+    return emitter.list[randomIndex];
+}
+vec3 SampleTriangle(vec3 A, vec3 B, vec3 C, uint seed)
+{
+    float b2 = rnd(seed);
+    float b1 = rnd(seed);
+    float b0 = 1.f - b1 - b2;
+
+    if(b0 < 0.f)
+    {
+        b1 = 1.f - b1;
+        b2 = 1.f - b2;
+        b0 = 1.f - b1 - b2;
+    }
+    return b0 * A + b1 * B + b2 * C;
+}
+
+float PdfLight(Emitter L)
+{
+    return 1.f / (L.area * numberOfLights);
+}
+vec3 EvalLight(Emitter L)
+{
+    return L.emission;
+}
+
+float GeometryFactor(vec3 Pa, vec3 Na, vec3 Pb, vec3 Nb)
+{
+    vec3 D = Pa - Pb;
+
+    float dotD = dot(D, D);
+
+    float result = abs((dot(D, Na) * dot(D, Nb)) / (dotD * dotD));
+
+    return result;
+}
+
+void AccumulateSample(vec3 firstNrm, float firstDepth, 
+                      ivec2 loc,
+                      float bilinearWeight, 
+                      inout vec4 sumC,
+                      inout float sumW)
+{
+    //Reterive
+    vec4 color = imageLoad(colPrev, loc);
+    vec3 nrm = imageLoad(ndPrev, loc).xyz;
+    float depth = imageLoad(ndPrev, loc).w;
+
+    float nThreshold = 0.95;
+    float dThreshold = 0.15;
+
+    float w = bilinearWeight;
+
+    float nrmEdgeCheck = dot(firstNrm, nrm);
+    float depthEdgeCheck = abs(firstDepth - depth);
+
+
+    if(nrmEdgeCheck < nThreshold)
+        w = 0.0f;
+
+    if(depthEdgeCheck > dThreshold)
+        w = 0.0f;
+
+    sumC += color * w;
+    sumW += w;
+}
+
+
+void main() 
+{
+    payload.seed = tea(gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x, pcRay.frameSeed);
+
+    const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    vec2 pixelNDC = pixelCenter/vec2(gl_LaunchSizeEXT.xy)*2.0 - 1.0;
+ 
+    vec3 eyeW    = (mats.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec4 pixelH = mats.viewInverse * mats.projInverse * vec4(pixelNDC.x, pixelNDC.y, 1, 1);
+    vec3 pixelW = pixelH.xyz/pixelH.w;
+    
+    vec3 rayO    = eyeW;
+    vec3 rayD = normalize(pixelW - eyeW);
+    payload.hit = false;
+
+    vec3 C = vec3(0,0,0);
+    vec3 W = vec3(1,1,1);
+    vec3 firstPos = vec3(0,0,0);
+    vec3 firstNrm = vec3(0,0,0);
+    vec3 firstColor = vec3(0,0,0);
+    float firstDepth = 0.f;
+
+    for (int i=0; i<pcRay.depth;  i++) 
+    {
+        traceRayEXT(topLevelAS,           // acceleration structure
+                    gl_RayFlagsOpaqueEXT, // rayFlags
+                    0xFF,                 // cullMask
+                    0,                    // sbtRecordOffset
+                    0,                    // sbtRecordStride
+                    0,                    // missIndex
+                    rayO,                 // ray origin
+                    0.001,                // ray min range
+                    rayD,                 // ray direction
+                    10000.0,              // ray max range
+                    0                     // payload (location = 0)
+                    );
+
+        if (!payload.hit) 
+            break; 
+
+        // Object data (containing 4 device addresses)
+        ObjDesc    objResources = objDesc.i[payload.instanceIndex];
+    
+        // Dereference the object's 4 device addresses
+        Vertices   vertices    = Vertices(objResources.vertexAddress);
+        Indices    indices     = Indices(objResources.indexAddress);
+        Materials  materials   = Materials(objResources.materialAddress);
+        MatIndices matIndices  = MatIndices(objResources.materialIndexAddress);
+  
+        // Use gl_PrimitiveID to access the triangle's vertices and material
+        ivec3 ind    = indices.i[payload.primitiveIndex]; // The triangle hit
+        int matIdx   = matIndices.i[payload.primitiveIndex]; // The triangles material index
+        Material mat = materials.m[matIdx]; // The triangles material
+
+        Vertex v0 = vertices.v[ind.x];
+        Vertex v1 = vertices.v[ind.y];
+        Vertex v2 = vertices.v[ind.z];
+        vec3 bc = payload.bc; // The barycentric coordinates of the hit point
+        vec3 nrm = bc.x*v0.nrm      + bc.y*v1.nrm      + bc.z*v2.nrm;
+        vec2 uv = bc.x*v0.texCoord + bc.y*v1.texCoord + bc.z*v2.texCoord;
+        vec3 N = normalize(nrm);
+
+        if(i == 0)
+        {
+            firstPos = payload.hitPos;
+            firstNrm = N;
+            firstColor = mat.diffuse;
+            firstDepth = payload.hitDistance;
+        }
+
+        if (dot(mat.emission,mat.emission) > 0.0) 
+        {
+            C += 0.5f * mat.emission * W; 
+            break; 
+        }
+
+        //Explicit
+        Emitter lightInfo = SampleLight(payload.seed);
+        vec3 randomLightPos = SampleTriangle(lightInfo.v0, lightInfo.v1, lightInfo.v2, payload.seed);
+        vec3 Wi = normalize(randomLightPos - payload.hitPos);
+        float dist = length(randomLightPos - payload.hitPos);
+        payload.occluded = true;
+
+        traceRayEXT(topLevelAS,
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        0xFF,
+        0,
+        0,
+        1,
+        payload.hitPos,
+        0.001,
+        Wi,
+        dist - 0.001,
+        0);
+
+        if(!payload.occluded)
+        {
+            ivec3 ind    = indices.i[payload.primitiveIndex];
+            Vertex v0 = vertices.v[ind.x];
+            Vertex v1 = vertices.v[ind.y];
+            Vertex v2 = vertices.v[ind.z];
+            const vec3 bc = payload.bc; // The barycentric coordinates of the hit point
+            const vec3 nrm = bc.x*v0.nrm      + bc.y*v1.nrm      + bc.z*v2.nrm;
+            const vec2 uv = bc.x*v0.texCoord + bc.y*v1.texCoord + bc.z*v2.texCoord;
+            vec3 N = normalize(nrm);
+            vec3 Wo = -rayD;
+            vec3 f = EvalBrdf(N, Wi, Wo, mat);
+            float p = PdfLight(lightInfo) / GeometryFactor(payload.hitPos, N, randomLightPos, lightInfo.normal);
+
+            C += 0.5f * W * (f/p) * EvalLight(lightInfo);
+        }
+
+
+
+        if (mat.textureId >= 0) 
+        {
+            uint txtId = objResources.txtOffset + mat.textureId;
+            mat.diffuse = texture(textureSamplers[(txtId)], uv).xyz; 
+        }
+
+
+        vec3 P = payload.hitPos;  // Current hit point
+        Wi = SampleBrdf(payload.seed, N);
+        vec3 Wo = -rayD;
+
+        vec3 f = EvalBrdf(N, Wi, Wo, mat);
+        float p = PdfBrdf(N,Wi)*pcRay.rr;
+        if (p != 0.0)
+            W *= f/p;           // Monte-Carlo
+
+        rayO = P;
+        rayD = Wi;
+    }
+
+
+
+    vec4 oldVal = imageLoad(colCurr, ivec2(gl_LaunchIDEXT.xy));
+    vec3 oldAve = oldVal.xyz;
+    float oldN = oldVal.w;
+
+    vec4 screenH = (mats.priorViewProj * vec4(firstPos, 1.0));
+    vec2 screen = ((screenH.xy / screenH.w) + vec2(1.0)) / 2.0;
+
+    if(dot(firstPos, firstPos) == 0.0 || 
+    screen.x < 0 || screen.x > 1 || screen.y < 0 || screen.y > 1)
+    {
+        oldN = 0;
+        oldAve = vec3(0);
+    }
+    else
+    {
+        vec2 floc = screen * gl_LaunchSizeEXT.xy - vec2(0.5);
+        vec2 off = fract(floc);
+        ivec2 iloc = ivec2(floc);
+
+        vec4 sumC = vec4(0,0,0,0);
+        float sumW = 0.f;
+
+        float x0 = 1.0 - off.x;
+        float x1 = off.x;
+        float y0 = 1.0 - off.y;
+        float y1 = off.y;
+
+        AccumulateSample(firstNrm, firstDepth, iloc + ivec2(0,0), x0 * y0, sumC, sumW);
+        AccumulateSample(firstNrm, firstDepth, iloc + ivec2(1,0), x1 * y0, sumC, sumW);
+        AccumulateSample(firstNrm, firstDepth, iloc + ivec2(0,1), x0 * y1, sumC, sumW);
+        AccumulateSample(firstNrm, firstDepth, iloc + ivec2(1,1), x1 * y1, sumC, sumW);
+
+
+        if(sumW == 0.0)
+        {
+            oldN = 0;
+            oldAve = vec3(0,0,0);
+        }
+        else
+        {
+            vec4 history = sumC / sumW; 
+            oldN = history.w;
+            oldAve = history.xyz;
+        }
+
+        
+    }
+
+
+    float newN = oldN + 1.0;
+    vec3 newAve = oldAve + (C - oldAve) / newN;
+
+    if(pcRay.alignmentTest != 1234)
+    {
+        imageStore(colCurr, ivec2(gl_LaunchIDEXT.xy), vec4(1, 0, 0, 1));
+        return;
+    }
+    else
+    {
+        if(any(isnan(newAve)) == false)
+            imageStore(colCurr, ivec2(gl_LaunchIDEXT.xy), vec4(newAve, newN));
+        if(any(isnan(firstColor)) == false)
+            imageStore(kdCurr, ivec2(gl_LaunchIDEXT.xy), vec4(firstColor, 0));
+        if(any(isnan(firstNrm)) == false && isnan(firstDepth) == false)
+            imageStore(ndCurr, ivec2(gl_LaunchIDEXT.xy), vec4(firstNrm, firstDepth));
+    }
+}
